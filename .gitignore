@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Environment
+.env
+
+# OS
+.DS_Store
+
+
+# Sensitive documents - never commit
+docs/India Offer Letter June 2025.pdf

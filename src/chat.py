@@ -16,6 +16,8 @@ if not api_key:
 
 client = genai.Client(api_key=api_key)
 
+FILE_PATH = os.getenv("PDF_FILE_PATH", "docs/Generative AI Primer - Bocconi.pdf")
+
 
 class Metadata(TypedDict):
     source: str
@@ -62,7 +64,7 @@ def _grounded_answer(context: str, user_input: str) -> str:
 
 @traceable(name="Similarity Search", run_type="retriever")
 def _similarity_search(
-    pool: ConnectionPool, vector: list[float], limit: int = 3
+    pool: ConnectionPool, vector: list[float], source: str, limit: int = 3
 ) -> list[SearchResult]:
     """Find the `limit` most similar chunks using cosine distance (<=>)."""
     with pool.connection() as conn:
@@ -70,10 +72,11 @@ def _similarity_search(
             """
             SELECT content, metadata, embedding <=> %s::vector AS distance
             FROM document_vectors
+            WHERE metadata->>'source' = %s
             ORDER BY distance 
             LIMIT %s
             """,
-            (str(vector), limit),
+            (str(vector), source, limit),
         ).fetchall()
         return rows
 
@@ -128,7 +131,8 @@ def run_rag_pipeline(pool: ConnectionPool, user_input: str) -> str:
 
     # 3. Similarity search for each variation
     all_search_results = [
-        _similarity_search(pool, vector, 3) for vector in query_vectors
+        _similarity_search(pool, vector, source=FILE_PATH, limit=3)
+        for vector in query_vectors
     ]
     print("--- DEBUG: All Search Results ---", len(all_search_results))
 

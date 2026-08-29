@@ -47,7 +47,8 @@ pdf-rag-python/
 │   ├── chunking.py        # Table-aware Markdown chunker
 │   └── test_chunking.py   # Sanity tests for the chunker
 ├── docker-compose.yml     # Postgres 16 + pgvector
-├── requirements.txt
+├── pyproject.toml          # Project declaration - dependencies live here
+├── uv.lock                 # Locked dependency graph - reproducible installs
 ├── .env.example           # Template for environment variables
 └── .gitignore             # .env is gitignored (keep secrets local)
 ```
@@ -56,7 +57,7 @@ pdf-rag-python/
 
 ### Prerequisites
 
-- Python 3.10+
+- [uv](https://docs.astral.sh/uv/) - manages Python, the venv, and dependencies (it can even install Python: `uv python install 3.12`)
 - Docker (for Postgres + pgvector)
 - A [Google AI Studio](https://aistudio.google.com/) API key
 - (Optional) A [LangSmith](https://smith.langchain.com/) API key for tracing
@@ -72,8 +73,10 @@ This runs `pgvector/pgvector:pg16` with a persistent volume.
 ### 2. Install dependencies
 
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
+
+This creates `.venv` and installs the exact locked environment from `uv.lock`.
 
 ### 3. Configure environment variables
 
@@ -100,7 +103,7 @@ PDF_FILE_PATH=docs/Generative AI Primer - Bocconi.pdf
 ### 4. Ingest a PDF
 
 ```bash
-python src/ingest.py
+uv run python src/ingest.py
 ```
 
 By default this ingests `docs/Generative AI Primer - Bocconi.pdf`. To ingest a different PDF (e.g. a private document), set `PDF_FILE_PATH` in your local `.env` - no code changes needed (see `FILE_PATH` in `src/ingest.py`). The pipeline:
@@ -116,7 +119,7 @@ Run it again after editing the PDF — only the changed file is re-processed.
 ### 5. Ask questions
 
 ```bash
-python src/chat.py
+uv run python src/chat.py
 ```
 
 ```
@@ -128,7 +131,7 @@ Ask a question about the PDF (or type 'exit'): what is the notice period?
 ### Run the chunker tests
 
 ```bash
-python src/test_chunking.py
+uv run python src/test_chunking.py
 ```
 
 ## How it works

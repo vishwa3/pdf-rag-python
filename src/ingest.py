@@ -25,6 +25,7 @@ FILE_PATH = os.getenv("PDF_FILE_PATH", "docs/Generative AI Primer - Bocconi.pdf"
 DB_CONFIG = {
     "host": "localhost",
     "port": os.getenv("DB_PORT"),
+    "connect_timeout": 5,  # fail fast if Postgres is down instead of hanging silently
     "user": os.getenv("DB_USER"),
     "password": os.getenv("DB_PASSWORD"),
     "dbname": os.getenv("DB_NAME"),
@@ -63,6 +64,7 @@ def _embed_text(text: str) -> list[float]:
 
 def ingest() -> None:
     """Run the full ingestion pipeline."""
+    print(f"[DB] Connecting to PostgreSQL on port {os.getenv("DB_PORT")}...")
     with connect(**DB_CONFIG) as conn:
         # 1. Enable vector extension & create tracking + vector tables
 

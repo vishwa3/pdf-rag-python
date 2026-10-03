@@ -6,9 +6,11 @@ PDFs are extracted to Markdown with **Gemini 2.5 Flash** (multimodal, table-awar
 
 ## Features
 
+- 🌐 **FastAPI Web Service & SSE Streaming** — REST API endpoints for ingestion and chat, plus real-time token streaming using Server-Sent Events (SSE)
+- 🖥️ **Interactive Web UI** — responsive browser chat interface with real-time token typing effect, blinking cursor, source chunk inspection, and error handling
 - 🔍 **Multimodal PDF extraction** — Gemini Vision converts PDFs into clean Markdown, preserving headings, lists, and tables
 - 📊 **Table-aware chunking** — custom chunker keeps tables intact (header re-attached to every split piece) with word-snapped overlap between chunks
-- 🧠 **Multi-query retrieval** — Gemini rewrites your question into alternative phrasings to improve recall, and all variations are embedded in a single API call
+- 🧠 **Multi-query retrieval & Diversity Filtering** — vector search combined with `difflib` similarity filtering to avoid near-duplicate chunks crowding top results
 - ⚡ **pgvector similarity search** — cosine distance (`<=>`) search over 3072-dimensional embeddings
 - 🔁 **Incremental ingestion** — SHA-256 file hash tracking skips unchanged files and re-ingests changed ones
 - 💬 **Grounded answers** — the LLM answers *only* from retrieved context, with an explicit "not found" fallback
@@ -20,18 +22,19 @@ PDFs are extracted to Markdown with **Gemini 2.5 Flash** (multimodal, table-awar
 ```mermaid
 flowchart LR
     subgraph Ingestion
-        A[PDF] -->|Gemini 2.5 Flash<br>multimodal extraction| B[Markdown]
+        A[PDF Upload / CLI] -->|Gemini 2.5 Flash<br>multimodal extraction| B[Markdown]
         B -->|table-aware chunker| C[Chunks]
         C -->|gemini-embedding-2| D[3072-dim vectors]
         D -->|psycopg| E[(PostgreSQL<br>+ pgvector)]
     end
     subgraph Query
-        F[User question] -->|query translation| G[3 query variations]
-        G -->|batch embedding| H[Vectors]
-        H -->|cosine similarity<br>top-3 each| E
-        E -->|flatten + dedup| I[Context]
-        I -->|grounded prompt| J[Gemini 2.5 Flash]
-        J --> K[Answer]
+        F[Web UI / Client] -->|HTTP / SSE| G[FastAPI / main.py]
+        G -->|embed question| H[Vector]
+        H -->|pgvector cosine distance| E
+        E -->|fetch top-12 candidates| I[Candidate Chunks]
+        I -->|difflib diversity filter| J[Top-3 Distinct Chunks]
+        J -->|grounded prompt| K[Gemini 2.5 Flash]
+        K -->|SSE token stream| F
     end
 ```
 
@@ -42,10 +45,13 @@ pdf-rag-python/
 ├── docs/
 │   └── Generative AI Primer - Bocconi.pdf  # Default PDF to ingest
 ├── src/
+│   ├── main.py            # FastAPI application (REST endpoints, SSE streaming, connection pool)
 │   ├── ingest.py          # Ingestion pipeline: extract → chunk → embed → store
-│   ├── chat.py            # Interactive chat: translate → embed → search → answer
+│   ├── chat.py            # CLI chat: translate → embed → search → answer
 │   ├── chunking.py        # Table-aware Markdown chunker
 │   └── test_chunking.py   # Sanity tests for the chunker
+├── static/
+│   └── index.html         # Frontend web UI (Server-Sent Events reader, typing animation)
 ├── docker-compose.yml     # Postgres 16 + pgvector
 ├── pyproject.toml          # Project declaration - dependencies live here
 ├── uv.lock                 # Locked dependency graph - reproducible installs
@@ -96,27 +102,33 @@ DB_NAME=postgres
 LANGSMITH_TRACING=true
 LANGSMITH_API_KEY=your_langsmith_api_key
 
-# Target PDF to ingest (defaults to docs/Generative AI Primer - Bocconi.pdf in code)
+# Target PDF to ingest via CLI (defaults to docs/Generative AI Primer - Bocconi.pdf)
 PDF_FILE_PATH=docs/Generative AI Primer - Bocconi.pdf
 ```
 
-### 4. Ingest a PDF
+### 4. Run the Web Application (Recommended)
+
+Start the FastAPI server:
+
+```bash
+uv run uvicorn src.main:app --reload
+```
+
+Open your browser at **[http://127.0.0.1:8000](http://127.0.0.1:8000)** to use the chat UI with real-time streaming answers and sources!
+
+---
+
+### Alternative: CLI Ingestion & Chat
+
+#### Ingest a PDF via CLI
 
 ```bash
 uv run python src/ingest.py
 ```
 
-By default this ingests `docs/Generative AI Primer - Bocconi.pdf`. To ingest a different PDF (e.g. a private document), set `PDF_FILE_PATH` in your local `.env` - no code changes needed (see `FILE_PATH` in `src/ingest.py`). The pipeline:
+By default this ingests `docs/Generative AI Primer - Bocconi.pdf`. To ingest a different PDF, set `PDF_FILE_PATH` in `.env`.
 
-1. Enables the `vector` extension and creates the `ingested_files` / `document_vectors` tables
-2. Computes the file's SHA-256 hash — skips if unchanged, purges old vectors if changed
-3. Extracts the PDF to Markdown with Gemini Vision
-4. Chunks it (1000 chars, 200 overlap) with the table-aware chunker
-5. Embeds each chunk and stores everything in pgvector
-
-Run it again after editing the PDF — only the changed file is re-processed.
-
-### 5. Ask questions
+#### Chat via CLI
 
 ```bash
 uv run python src/chat.py
@@ -134,15 +146,28 @@ Ask a question about the PDF (or type 'exit'): what is the notice period?
 uv run python src/test_chunking.py
 ```
 
+## API Endpoints
+
+FastAPI provides interactive Swagger documentation at `http://127.0.0.1:8000/docs`.
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/` | Serves the browser web chat UI (`static/index.html`) |
+| `POST` | `/api/chat/stream` | Streams answer tokens in real-time via Server-Sent Events (SSE) |
+| `POST` | `/api/chat` | Standard JSON endpoint returning full answer and source chunks |
+| `POST` | `/api/ingest` | Multipart file upload to ingest and index a PDF on the fly |
+
 ## How it works
 
-### Query pipeline
+### Query & Streaming Pipeline
 
-1. **Query translation** — Gemini 2.5 Flash generates 2 alternative phrasings of your question (e.g. `generative AI` → `artificial intelligence`, `AI foundations`)
-2. **Batch embedding** — all query variations are embedded in one API call
-3. **Similarity search** — top-3 nearest chunks per variation using pgvector's cosine distance operator (`<=>`)
-4. **Deduplication** — results are deduplicated by content using a dict comprehension
-5. **Grounded answer** — Gemini answers using *only* the retrieved snippets; if the answer isn't in them, it responds with *"I cannot find that information inside the uploaded document."*
+1. **Embedding**: The user's query is converted to a 3072-dimensional vector with `gemini-embedding-2`.
+2. **pgvector Retrieval**: Cosine distance search (`<=>`) retrieves the top 12 candidate chunks from Postgres.
+3. **Diversity & Deduplication (`difflib`)**: Chunks from near-identical documents or repeated clauses are filtered using `difflib.SequenceMatcher` to prevent redundant passages from crowding the top-3 context window.
+4. **SSE Event Stream**:
+   - Sends the retrieved source metadata first (`data: {"sources": [...]}`).
+   - Streams LLM generated tokens one by one (`data: {"token": "..."}`).
+   - Yields `data: [DONE]` on completion (or `data: {"error": "..."}` on exceptions).
 
 ### Table-aware chunker
 
@@ -159,7 +184,7 @@ A naive chunker can split a Markdown table mid-row, leaving pieces with no colum
 | Target PDF | `PDF_FILE_PATH` in `.env` | `docs/Generative AI Primer - Bocconi.pdf` |
 | Chunk size / overlap | `markdown_aware_chunk(...)` call in `src/ingest.py` | `1000` / `200` |
 | Results per query | `limit` in `run_rag_pipeline` (`src/chat.py`) | `3` |
-| LLM model | `model=` in `src/chat.py` / `src/ingest.py` | `gemini-2.5-flash` |
+| LLM model | `model=` in `src/chat.py` / `src/ingest.py` / `src/main.py` | `gemini-2.5-flash` |
 | Embedding model | `model=` in `_embed_text` / `_embed_questions` | `gemini-embedding-2` |
 | Vector dimensions | `vector(3072)` in `src/ingest.py` | `3072` |
 
@@ -167,8 +192,10 @@ A naive chunker can split a Markdown table mid-row, leaving pieces with no colum
 
 ## Tech stack
 
-- [google-genai](https://pypi.org/project/google-genai/) — Gemini 2.5 Flash + embeddings
-- [PostgreSQL](https://www.postgresql.org/) + [pgvector](https://github.com/pgvector/pgvector) — vector storage and similarity search
-- [psycopg 3](https://www.psycopg.org/psycopg3/) + connection pooling — Postgres driver
-- [LangSmith](https://smith.langchain.com/) — observability and tracing
-- [Docker Compose](https://docs.docker.com/compose/) — one-command database setup
+- **FastAPI** + **Uvicorn** — modern async web framework & ASGI server
+- **Server-Sent Events (SSE)** — lightweight real-time token streaming
+- **google-genai** — Gemini 2.5 Flash + embeddings
+- **PostgreSQL** + **pgvector** — vector storage and cosine distance similarity search
+- **psycopg 3** + `psycopg-pool` — connection pooling for high-throughput database queries
+- **LangSmith** — observability and tracing
+- **Docker Compose** — one-command database setup

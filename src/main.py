@@ -6,15 +6,14 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from google import genai
 from langsmith import traceable
-from psycopg import Connection
-from psycopg.rows import DictRow, dict_row
-from psycopg_pool import ConnectionPool
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel
-from fastapi.staticfiles import StaticFiles
 
-from ingest import ensure_schema, ingest_pdf
+from ingest import ingest_pdf
 
 load_dotenv()
 
@@ -22,14 +21,40 @@ load_dotenv()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: create and open pool
-    app.state.pool = ConnectionPool[Connection[DictRow]](
-        kwargs=DB_CONFIG, min_size=1, max_size=4, open=True
+    app.state.pool = AsyncConnectionPool(
+        kwargs=DB_CONFIG, min_size=1, max_size=4, open=False
     )
-    with app.state.pool.connection() as conn:
-        ensure_schema(conn)
+    await app.state.pool.open()
+    app.state.ai = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+
+    async with app.state.pool.connection() as conn:
+        await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ingested_files (
+                id SERIAL PRIMARY KEY,
+                file_path TEXT UNIQUE NOT NULL,
+                file_hash VARCHAR(64) NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ingested_files_hash ON ingested_files(file_hash);"
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS document_vectors (
+                id SERIAL PRIMARY KEY,
+                content TEXT NOT NULL,
+                metadata JSONB,
+                embedding vector(3072)
+            )
+            """
+        )
     yield
-    # Shutdown: close pool
-    app.state.pool.close()
+    await app.state.pool.close()
 
 
 app = FastAPI(title="PDF RAG PYTHON", lifespan=lifespan)
@@ -47,7 +72,7 @@ class Source(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
-    sources: list[Source] = []
+    sources: list[Source]
 
 
 DB_CONFIG = {
@@ -61,13 +86,13 @@ DB_CONFIG = {
 
 
 @app.post("/api/chat")
-def chat(http_request: Request, request: ChatRequest) -> ChatResponse:
-    pool: ConnectionPool[Connection[DictRow]] = http_request.app.state.pool
+async def chat(http_request: Request, request: ChatRequest) -> ChatResponse:
+    pool: AsyncConnectionPool = http_request.app.state.pool
 
     # 1. Embed the user's question -> 3072-dim vector
 
-    ai = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-    embedding_result = ai.models.embed_content(
+    ai: genai.Client = http_request.app.state.ai
+    embedding_result = await ai.aio.models.embed_content(
         model="gemini-embedding-2", contents=request.question
     )
     embeddings = embedding_result.embeddings
@@ -78,8 +103,8 @@ def chat(http_request: Request, request: ChatRequest) -> ChatResponse:
     user_question_vector = embeddings[0].values
 
     # 2. Query pgvector for the most similar chunks
-    with pool.connection() as conn:
-        rows = conn.execute(
+    async with pool.connection() as conn:
+        cur = await conn.execute(
             """
             SELECT content, metadata, embedding <=> %s::vector AS distance
             FROM document_vectors
@@ -87,8 +112,8 @@ def chat(http_request: Request, request: ChatRequest) -> ChatResponse:
             LIMIT 12
             """,
             (str(user_question_vector),),
-        ).fetchall()
-        print(rows)
+        )
+        rows: list[dict] = await cur.fetchall()  # type: ignore[assignment]
 
     # 2b. Keep the best chunk, skipping near-duplicates: different versions of
     # the same letter crowd the top-3 with near-identical chunks otherwise.
@@ -105,16 +130,12 @@ def chat(http_request: Request, request: ChatRequest) -> ChatResponse:
         selected.append(row)
         if len(selected) == 3:
             break
-    print(
-        f" Selected {len(selected)} chunks after filtering for near-duplicates",
-        selected,
-    )
 
     # 3. Build context from the retrieved chunks
     context = "\n---\n".join(row["content"] for row in selected)
 
     # 4. Generate a grounded answer
-    response = ai.models.generate_content(
+    response = await ai.aio.models.generate_content(
         model="gemini-2.5-flash",
         contents=(
             "You are a precise assistant. Answer the user's question using ONLY the "
@@ -157,12 +178,13 @@ def ingest_document(file: UploadFile = File(...)) -> dict:
     return {"status": "ok", "file": filename, "chunks": chunk_count}
 
 
-def _stream_answer(http_request: Request, question: str):
-    pool: ConnectionPool[Connection[DictRow]] = http_request.app.state.pool
+async def _stream_answer(http_request: Request, question: str):
+    """ASYNC generator: yields SSE events — sources first, then tokens."""
+    pool: AsyncConnectionPool = http_request.app.state.pool
 
     # 1. Embed the user's question -> 3072-dim vector
-    ai = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-    embedding_result = ai.models.embed_content(
+    ai = http_request.app.state.ai
+    embedding_result = await ai.aio.models.embed_content(
         model="gemini-embedding-2", contents=question
     )
     embeddings = embedding_result.embeddings
@@ -172,8 +194,8 @@ def _stream_answer(http_request: Request, question: str):
     user_question_vector = embeddings[0].values
 
     # 2. Query pgvector for the most similar chunks (LIMIT 12 like /api/chat)
-    with pool.connection() as conn:
-        rows = conn.execute(
+    async with pool.connection() as conn:
+        cur = await conn.execute(
             """
             SELECT content, metadata, embedding <=> %s::vector AS distance
             FROM document_vectors
@@ -181,7 +203,8 @@ def _stream_answer(http_request: Request, question: str):
             LIMIT 12
             """,
             (str(user_question_vector),),
-        ).fetchall()
+        )
+        rows: list[dict] = await cur.fetchall()  # type: ignore[assignment]
 
     # 3. Keep 3 best chunks, skipping near-duplicates (same logic as /api/chat)
     selected: list[dict] = []
@@ -230,11 +253,11 @@ def _stream_answer(http_request: Request, question: str):
 
     # 6. Stream tokens as they're generated
     try:
-        stream = ai.models.generate_content_stream(
+        stream = await ai.aio.models.generate_content_stream(
             model="gemini-2.5-flash", contents=prompt, config={"temperature": 0.1}
         )
 
-        for chunk in stream:
+        async for chunk in stream:
             if chunk.text:
                 yield f"data: {json.dumps({'token': chunk.text})}\n\n"
 
@@ -246,7 +269,7 @@ def _stream_answer(http_request: Request, question: str):
 
 
 @app.post("/api/chat/stream")
-def chat_stream(http_request: Request, request: ChatRequest) -> StreamingResponse:
+async def chat_stream(http_request: Request, request: ChatRequest) -> StreamingResponse:
     return StreamingResponse(
         _stream_answer(http_request, request.question), media_type="text/event-stream"
     )
